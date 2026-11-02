@@ -13,6 +13,7 @@ The CCD look is a software simulation; it does not change the camera sensor. The
 - Delete a photo from its preview after confirming. The photo is moved to the Raspberry Pi user's desktop Trash and can be restored from the file manager's Trash before it is emptied.
 - Use a responsive interface on phones, computers, or the Raspberry Pi desktop.
 - Record, play back, and download MP4 video. Video uses original colors and does not include audio.
+- The album shows photos and videos together; deleted videos are moved to the desktop Trash.
 
 ## Privacy and access
 

@@ -141,9 +141,9 @@ def stop_video():
         return result
 
 
-def trash_photo(name):
+def trash_photo(name, source_folder=PHOTO_DIR):
     """Move one regular photo into the user's desktop Trash without overwriting."""
-    if not PHOTO_NAME.fullmatch(name):
+    if not (PHOTO_NAME.fullmatch(name) if source_folder == PHOTO_DIR else VIDEO_NAME.fullmatch(name)):
         raise FileNotFoundError(name)
     data_home = os.environ.get('XDG_DATA_HOME', '')
     data_home = Path(data_home) if data_home and os.path.isabs(data_home) else Path.home() / '.local' / 'share'
@@ -155,7 +155,7 @@ def trash_photo(name):
                 raise OSError('回收站目录不能是符号链接')
             folder.mkdir(mode=0o700, parents=True, exist_ok=True)
         flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
-        source_dir = os.open(PHOTO_DIR, flags)
+        source_dir = os.open(source_folder, flags)
         try:
             try:
                 source = os.open(name, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0), dir_fd=source_dir)
@@ -170,13 +170,13 @@ def trash_photo(name):
                 dest_dir = os.open(files, flags)
                 try:
                     # A random name and exclusive metadata/destination creation prevent overwrite.
-                    trash_name = name[:-4] + '-' + uuid.uuid4().hex + '.jpg'
+                    trash_name = name[:-4] + '-' + uuid.uuid4().hex + name[-4:]
                     metadata = info / (trash_name + '.trashinfo')
                     metadata_fd = os.open(metadata, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
                     created = False
                     try:
                         with os.fdopen(metadata_fd, 'w', encoding='utf-8') as f:
-                            f.write('[Trash Info]\nPath=' + quote(str(PHOTO_DIR.absolute() / name), safe='/') +
+                            f.write('[Trash Info]\nPath=' + quote(str(source_folder.absolute() / name), safe='/') +
                                     '\nDeletionDate=' + datetime.now().strftime('%Y-%m-%dT%H:%M:%S') + '\n')
                             f.flush()
                             os.fsync(f.fileno())
@@ -241,7 +241,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == '/api/status':
             self.json_response(200, {'ready': READY, 'error': ERROR, 'recording': RECORDING})
         elif path == '/api/videos':
-            videos = sorted((p for p in VIDEO_DIR.glob('CCD_*.mp4') if VIDEO_NAME.fullmatch(p.name)), key=lambda p: p.name, reverse=True)[:100]
+            videos = sorted((p for p in VIDEO_DIR.glob('CCD_*.mp4') if VIDEO_NAME.fullmatch(p.name) and not (RECORDING and RECORDING['name'] == p.name)), key=lambda p: p.name, reverse=True)[:100]
             self.json_response(200, {'videos': [{'name': p.name, 'url': '/videos/' + quote(p.name)} for p in videos]})
         elif path.startswith('/videos/'):
             name = unquote(path[len('/videos/'):])
@@ -350,7 +350,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = urlsplit(self.path).path
-        if not path.startswith('/api/photos/'):
+        if not (path.startswith('/api/photos/') or path.startswith('/api/videos/')):
             self.json_response(404, {'error': '未找到照片'})
             return
         origin = self.headers.get('Origin', '')
@@ -358,10 +358,15 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.scheme not in ('http', 'https') or parsed.netloc != self.headers.get('Host'):
             self.json_response(403, {'error': '请求来源不受信任'})
             return
-        name = unquote(path[len('/api/photos/'):])
+        is_video = path.startswith('/api/videos/')
+        name = unquote(path[len('/api/videos/'):] if is_video else path[len('/api/photos/'):])
         try:
-            trash_photo(name)
+            if is_video and RECORDING and RECORDING['name'] == name:
+                raise ValueError('录像正在录制，不能删除')
+            trash_photo(name, VIDEO_DIR if is_video else PHOTO_DIR)
             self.json_response(200, {'ok': True})
+        except ValueError as exc:
+            self.json_response(400, {'error': str(exc)})
         except FileNotFoundError:
             self.json_response(404, {'error': '照片不存在或不能删除'})
         except OSError:
