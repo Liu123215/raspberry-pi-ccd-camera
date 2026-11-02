@@ -12,6 +12,7 @@ The CCD look is a software simulation; it does not change the camera sensor. The
 - Save JPEG images locally, request still captures at 2592 × 1944, and view or download up to the most recent 100 photos. Older photos are not deleted when the gallery limit is reached.
 - Delete a photo from its preview after confirming. The photo is moved to the Raspberry Pi user's desktop Trash and can be restored from the file manager's Trash before it is emptied.
 - Use a responsive interface on phones, computers, or the Raspberry Pi desktop.
+- Record, play back, and download MP4 video. Video uses original colors and does not include audio.
 
 ## Privacy and access
 
@@ -66,6 +67,8 @@ On the Raspberry Pi, open `http://127.0.0.1:8091/` in a browser. To connect from
 Select a tone, press the shutter, and wait for the save confirmation. Open a gallery thumbnail to view the photo; use the download control to save it to the device you are using. The delete control asks for confirmation and moves the image to the Raspberry Pi user's Trash. To recover it, open the Raspberry Pi file manager's Trash, find the photo, and choose its restore action. Photos are not permanently removed until the Trash is emptied or cleaned by another mechanism.
 
 The original JPEG files are stored under `~/Pictures/CCD Camera/` for the user running the service. The directory is created automatically; filenames contain the Raspberry Pi's system time and a random suffix. Keep separate backups of photos you want to retain.
+
+Videos are saved in the project's `videos/` directory. Stop recording before taking a photo, keep the device powered on, and monitor available storage during recording.
 
 ## Optional: run as a user service
 

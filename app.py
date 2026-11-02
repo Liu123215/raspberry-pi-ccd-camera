@@ -17,8 +17,11 @@ import uuid
 
 from PIL import Image, ImageEnhance
 from picamera2 import Picamera2
+from picamera2.encoders import LibavH264Encoder
+from picamera2.outputs import PyavOutput
 
 ROOT = Path(__file__).resolve().parent
+os.chdir(ROOT)
 PHOTO_DIR = Path.home() / 'Pictures' / 'CCD Camera'
 PHOTO_DIR.mkdir(parents=True, exist_ok=True)
 CAMERA_LOCK = threading.Lock()
@@ -31,6 +34,10 @@ READY = False
 ERROR = '摄像头正在启动'
 PHOTO_NAME = re.compile(r'CCD_[0-9]{8}_[0-9]{6}_[0-9a-f]{6}\.jpg\Z')
 TRASH_LOCK = threading.Lock()
+VIDEO_NAME = re.compile(r'CCD_[0-9]{8}_[0-9]{6}_[0-9a-f]{6}\.mp4\Z')
+VIDEO_DIR = ROOT / 'videos'
+VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+RECORDING = None
 
 
 def set_error(message):
@@ -86,6 +93,8 @@ def take_photo(effect):
     if not READY or CAMERA is None:
         raise RuntimeError(ERROR or '摄像头尚未就绪')
     with CAMERA_LOCK:
+        if RECORDING is not None:
+            raise RuntimeError('录像期间不能拍照，请先停止录像')
         image = CAMERA.switch_mode_and_capture_image(STILL_CONFIG, 'main')
     image = ccd_effect(image) if effect == 'ccd' else image.convert('RGB')
     name = 'CCD_' + datetime.now().strftime('%Y%m%d_%H%M%S_') + uuid.uuid4().hex[:6] + '.jpg'
@@ -98,6 +107,38 @@ def take_photo(effect):
         if temp.exists():
             temp.unlink()
     return '/photos/' + quote(name)
+
+
+def start_video():
+    global RECORDING
+    with CAMERA_LOCK:
+        if not READY or CAMERA is None:
+            raise RuntimeError('摄像头尚未就绪')
+        if RECORDING is not None:
+            raise RuntimeError('已经在录像')
+        name = 'CCD_' + datetime.now().strftime('%Y%m%d_%H%M%S_') + uuid.uuid4().hex[:6] + '.mp4'
+        path = VIDEO_DIR / name
+        encoder = LibavH264Encoder(bitrate=3000000)
+        output = PyavOutput(str(path))
+        CAMERA.start_encoder(encoder, output)
+        RECORDING = {'name': name, 'started': time.time()}
+        return dict(RECORDING)
+
+
+def stop_video():
+    global RECORDING
+    with CAMERA_LOCK:
+        if RECORDING is None:
+            raise RuntimeError('当前没有正在录制的视频')
+        result = dict(RECORDING)
+        try:
+            CAMERA.stop_encoder()
+        finally:
+            RECORDING = None
+        if not (VIDEO_DIR / result['name']).is_file() or (VIDEO_DIR / result['name']).stat().st_size == 0:
+            raise RuntimeError('录像未能保存，请检查摄像头和存储空间')
+        result['url'] = '/videos/' + quote(result['name'])
+        return result
 
 
 def trash_photo(name):
@@ -198,7 +239,44 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 self.send_error(500, 'Interface file unavailable')
         elif path == '/api/status':
-            self.json_response(200, {'ready': READY, 'error': ERROR})
+            self.json_response(200, {'ready': READY, 'error': ERROR, 'recording': RECORDING})
+        elif path == '/api/videos':
+            videos = sorted((p for p in VIDEO_DIR.glob('CCD_*.mp4') if VIDEO_NAME.fullmatch(p.name)), key=lambda p: p.name, reverse=True)[:100]
+            self.json_response(200, {'videos': [{'name': p.name, 'url': '/videos/' + quote(p.name)} for p in videos]})
+        elif path.startswith('/videos/'):
+            name = unquote(path[len('/videos/'):])
+            if not VIDEO_NAME.fullmatch(name) or (RECORDING and RECORDING['name'] == name):
+                self.send_error(404)
+                return
+            try:
+                video = (VIDEO_DIR / name).open('rb')
+                size = os.fstat(video.fileno()).st_size
+                start, end = 0, size - 1
+                range_header = self.headers.get('Range')
+                if range_header:
+                    match = re.fullmatch(r'bytes=(\d+)-(\d*)', range_header)
+                    if not match or int(match.group(1)) >= size:
+                        video.close(); self.send_error(416); return
+                    start = int(match.group(1))
+                    end = min(int(match.group(2)), end) if match.group(2) else end
+                    if end < start:
+                        video.close(); self.send_error(416); return
+                self.send_response(206 if range_header else 200)
+                self.send_header('Content-Type', 'video/mp4')
+                self.send_header('Accept-Ranges', 'bytes')
+                self.send_header('Content-Length', str(end - start + 1))
+                if range_header: self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+                self.end_headers()
+                with video:
+                    video.seek(start)
+                    remaining = end - start + 1
+                    while remaining:
+                        chunk = video.read(min(65536, remaining))
+                        if not chunk: break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            except (OSError, BrokenPipeError):
+                pass
         elif path == '/api/photos':
             photos = sorted(PHOTO_DIR.glob('CCD_*.jpg'), key=lambda p: p.name, reverse=True)[:100]
             self.json_response(200, {'photos': [{'name': p.name, 'url': '/photos/' + quote(p.name)} for p in photos]})
@@ -239,7 +317,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
-        if urlsplit(self.path).path != '/api/capture':
+        path = urlsplit(self.path).path
+        if path not in ('/api/capture', '/api/video/start', '/api/video/stop'):
             self.send_error(404)
             return
         # Reject browser requests from other origins on the same network.
@@ -248,6 +327,10 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(403, {'error': '请求来源不受信任'})
             return
         try:
+            if path == '/api/video/start':
+                self.json_response(200, start_video()); return
+            if path == '/api/video/stop':
+                self.json_response(200, stop_video()); return
             length = int(self.headers.get('Content-Length', '0'))
             if length < 0 or length > 1024:
                 self.json_response(413, {'error': '请求过大'})
@@ -263,7 +346,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, AttributeError):
             self.json_response(400, {'error': '请求格式不正确'})
         except Exception as exc:
-            self.json_response(500, {'error': '拍照失败：' + str(exc)})
+            self.json_response(500, {'error': ('录像操作失败：' if path.startswith('/api/video/') else '拍照失败：') + str(exc)})
 
     def do_DELETE(self):
         path = urlsplit(self.path).path
@@ -301,6 +384,8 @@ if __name__ == '__main__':
     finally:
         server.server_close()
         if CAMERA is not None:
+            if RECORDING is not None:
+                CAMERA.stop_encoder()
             CAMERA.stop()
             CAMERA.close()
 
