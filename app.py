@@ -8,6 +8,9 @@ from io import BytesIO
 import json
 import os
 import re
+import errno
+import shutil
+import stat
 import threading
 import time
 import uuid
@@ -26,6 +29,8 @@ CAMERA = None
 STILL_CONFIG = None
 READY = False
 ERROR = '摄像头正在启动'
+PHOTO_NAME = re.compile(r'CCD_[0-9]{8}_[0-9]{6}_[0-9a-f]{6}\.jpg\Z')
+TRASH_LOCK = threading.Lock()
 
 
 def set_error(message):
@@ -93,6 +98,80 @@ def take_photo(effect):
         if temp.exists():
             temp.unlink()
     return '/photos/' + quote(name)
+
+
+def trash_photo(name):
+    """Move one regular photo into the user's desktop Trash without overwriting."""
+    if not PHOTO_NAME.fullmatch(name):
+        raise FileNotFoundError(name)
+    data_home = os.environ.get('XDG_DATA_HOME', '')
+    data_home = Path(data_home) if data_home and os.path.isabs(data_home) else Path.home() / '.local' / 'share'
+    trash = data_home / 'Trash'
+    files, info = trash / 'files', trash / 'info'
+    with TRASH_LOCK:
+        for folder in (trash, files, info):
+            if folder.is_symlink():
+                raise OSError('回收站目录不能是符号链接')
+            folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
+        source_dir = os.open(PHOTO_DIR, flags)
+        try:
+            try:
+                source = os.open(name, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0), dir_fd=source_dir)
+            except OSError as exc:
+                if exc.errno in (errno.ENOENT, errno.ELOOP):
+                    raise FileNotFoundError(name) from exc
+                raise
+            try:
+                original = os.fstat(source)
+                if not stat.S_ISREG(original.st_mode):
+                    raise FileNotFoundError(name)
+                dest_dir = os.open(files, flags)
+                try:
+                    # A random name and exclusive metadata/destination creation prevent overwrite.
+                    trash_name = name[:-4] + '-' + uuid.uuid4().hex + '.jpg'
+                    metadata = info / (trash_name + '.trashinfo')
+                    metadata_fd = os.open(metadata, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+                    created = False
+                    try:
+                        with os.fdopen(metadata_fd, 'w', encoding='utf-8') as f:
+                            f.write('[Trash Info]\nPath=' + quote(str(PHOTO_DIR.absolute() / name), safe='/') +
+                                    '\nDeletionDate=' + datetime.now().strftime('%Y-%m-%dT%H:%M:%S') + '\n')
+                            f.flush()
+                            os.fsync(f.fileno())
+                        try:
+                            os.link(name, trash_name, src_dir_fd=source_dir, dst_dir_fd=dest_dir, follow_symlinks=False)
+                            created = True
+                            linked = os.stat(trash_name, dir_fd=dest_dir, follow_symlinks=False)
+                            if (linked.st_dev, linked.st_ino) != (original.st_dev, original.st_ino) or not stat.S_ISREG(linked.st_mode):
+                                raise OSError('照片在删除时发生变化，请重试')
+                        except OSError as exc:
+                            if exc.errno != errno.EXDEV:
+                                raise
+                            target = os.open(trash_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600, dir_fd=dest_dir)
+                            created = True
+                            with os.fdopen(target, 'wb') as out, os.fdopen(os.dup(source), 'rb') as inp:
+                                shutil.copyfileobj(inp, out)
+                                out.flush()
+                                os.fsync(out.fileno())
+                        current = os.stat(name, dir_fd=source_dir, follow_symlinks=False)
+                        if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino) or not stat.S_ISREG(current.st_mode):
+                            raise OSError('照片在删除时发生变化，请重试')
+                        os.unlink(name, dir_fd=source_dir)
+                    except BaseException:
+                        if created:
+                            try:
+                                os.unlink(trash_name, dir_fd=dest_dir)
+                            except FileNotFoundError:
+                                pass
+                        metadata.unlink(missing_ok=True)
+                        raise
+                finally:
+                    os.close(dest_dir)
+            finally:
+                os.close(source)
+        finally:
+            os.close(source_dir)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -185,6 +264,25 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response(400, {'error': '请求格式不正确'})
         except Exception as exc:
             self.json_response(500, {'error': '拍照失败：' + str(exc)})
+
+    def do_DELETE(self):
+        path = urlsplit(self.path).path
+        if not path.startswith('/api/photos/'):
+            self.json_response(404, {'error': '未找到照片'})
+            return
+        origin = self.headers.get('Origin', '')
+        parsed = urlsplit(origin)
+        if parsed.scheme not in ('http', 'https') or parsed.netloc != self.headers.get('Host'):
+            self.json_response(403, {'error': '请求来源不受信任'})
+            return
+        name = unquote(path[len('/api/photos/'):])
+        try:
+            trash_photo(name)
+            self.json_response(200, {'ok': True})
+        except FileNotFoundError:
+            self.json_response(404, {'error': '照片不存在或不能删除'})
+        except OSError:
+            self.json_response(500, {'error': '无法移动照片到回收站，请检查存储和权限'})
 
 
 class Server(ThreadingHTTPServer):
